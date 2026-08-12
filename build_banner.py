@@ -1,20 +1,33 @@
 """
 Animated GitHub profile banner generator.
-Source of truth. Emits dark.svg / light.svg + .npy caches + metrics.
+Master Prompt Specification Implementation.
+Emits dark.svg / light.svg + still PNG preview images + metrics.
 """
-import io, json, math
+import io, json, math, os
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
 from scipy import ndimage as ndi
 from scipy.optimize import linear_sum_assignment
 from scipy.cluster.vq import kmeans2
-import cairosvg
 
 rng = np.random.default_rng(7)
 
-SRC   = "/mnt/user-data/uploads/Anand_photo.png"
-PADW  = 1400          # white side-padding so the crop can pull back to head+shoulders
-ICONS = "/home/claude/package/icons"
+# Search locations for photo
+PHOTO_PATHS = [
+    r"c:\Users\Anandamirtharaj\OneDrive\Desktop\Anandamirtharaj-dev-main\assets\about_photo.png",
+    r"c:\Users\Anandamirtharaj\OneDrive\Desktop\Anandamirtharaj-dev-main\assets\user_picture.jpg",
+]
+
+SRC = None
+for p in PHOTO_PATHS:
+    if os.path.exists(p):
+        SRC = p
+        break
+
+if not SRC:
+    raise FileNotFoundError("User photo not found in desktop assets.")
+
+PADW = 1400          # white side-padding so the crop can pull back to head+shoulders
 GW, GH = 300, 340
 
 # ══════════════════════════════════════════════════════════ palette
@@ -63,12 +76,10 @@ ROWS = [
     ("Grid.LeetCode",  "/u/anandamirtharaj"),
 ]
 HANDLE = "@Anand180106"
-LOGOS  = ["vercel", "supabase", "render"]
+LOGOS  = ["vercel", "code", "supabase"]
 
 # ══════════════════════════════════════════════════════════ 1. portrait
 def load_padded():
-    """Pad the white studio background sideways so the crop can pull back
-       far enough for head+shoulders without running out of image."""
     im = Image.open(SRC).convert("RGB")
     w, h = im.size
     pad = Image.new("RGB", (PADW, h), (255, 255, 255))
@@ -76,7 +87,6 @@ def load_padded():
     return pad
 
 def subject_mask(rgb, t=35):
-    """Background is a white sweep -> threshold on distance from WHITE."""
     d = np.sqrt(((255 - rgb.astype(np.float32)) ** 2).sum(2))
     m = ndi.binary_fill_holes(ndi.binary_closing(d > t, np.ones((15, 15))))
     lab, n = ndi.label(m)
@@ -106,13 +116,17 @@ def fs_serpentine(g):
                 if 0 <= nx < w: a[y + 1, nx] += err * .0625
     return out
 
-CROP_H, CROP_TOP, CROP_CX = 1560, 14, PADW // 2
-CROP_W = int(round(CROP_H * GW / GH))
-CROP = (CROP_CX - CROP_W // 2, CROP_TOP, CROP_CX - CROP_W // 2 + CROP_W, CROP_TOP + CROP_H)
-
 def portrait_bits():
     im = load_padded()
+    w, h = im.size
     mfull = subject_mask(np.asarray(im))
+    
+    CROP_H = int(h * 0.85)
+    CROP_TOP = int(h * 0.05)
+    CROP_CX = PADW // 2
+    CROP_W = int(round(CROP_H * GW / GH))
+    CROP = (CROP_CX - CROP_W // 2, CROP_TOP, CROP_CX - CROP_W // 2 + CROP_W, CROP_TOP + CROP_H)
+
     im_c = im.crop(CROP).resize((GW, GH), Image.LANCZOS)
     mask = np.asarray(Image.fromarray((mfull * 255).astype(np.uint8))
                       .crop(CROP).resize((GW, GH), Image.LANCZOS)) > 127
@@ -124,17 +138,31 @@ def portrait_bits():
     g = np.asarray(p)
 
     bits = fs_serpentine(np.where(mask, g, 0).astype(np.uint8)) & core
-    # Both themes share one dot set: see notes. Light = same dots, dark hue.
     return bits, bits, core
 
 # ══════════════════════════════════════════════════════════ 2. logo clouds
+def draw_logo_image(name):
+    im = Image.new("L", (240, 240), 255)
+    dr = ImageDraw.Draw(im)
+    if name == "vercel":
+        dr.polygon([(120, 35), (215, 205), (25, 205)], fill=0)
+    elif name == "code":
+        # Slash
+        dr.polygon([(135, 40), (155, 40), (105, 200), (85, 200)], fill=0)
+        # Left bracket <
+        dr.polygon([(75, 120), (115, 70), (95, 70), (55, 120), (95, 170), (115, 170)], fill=0)
+        # Right bracket >
+        dr.polygon([(165, 120), (125, 70), (145, 70), (185, 120), (145, 170), (125, 170)], fill=0)
+    elif name == "supabase":
+        # Lightning bolt shape
+        dr.polygon([(130, 25), (65, 130), (120, 130), (110, 215), (175, 110), (120, 110)], fill=0)
+    return im
+
 def logo_points(name, n=900):
-    png = cairosvg.svg2png(url=f"{ICONS}/{name}.svg", output_width=240,
-                           output_height=240, background_color="white")
-    a = np.asarray(Image.open(io.BytesIO(png)).convert("L"))
+    im = draw_logo_image(name)
+    a = np.asarray(im)
     fill = a < 128
-    ys, xs = np.where(fill)
-    # jittered hex lattice inside the silhouette, tuned to hit n
+    
     lo, hi = 1.5, 40.0
     for _ in range(60):
         s = (lo + hi) / 2
@@ -157,14 +185,13 @@ def logo_points(name, n=900):
     if len(pts) > n:
         pts = pts[rng.choice(len(pts), n, replace=False)]
     pts += rng.normal(0, s * 0.13, pts.shape)
-    # normalise into portrait grid coords, centred, ~62% of frame
+    
     c = pts.mean(0); span = max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1]))
     k = (GW * 0.60) / span
     pts = (pts - c) * k + np.array([GW / 2, GH / 2])
     return pts
 
 def ot_match(a, b):
-    """Optimal transport: shortest total squared travel."""
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
     C = ((a[:, None, :] - b[None, :, :]) ** 2).sum(2)
@@ -175,7 +202,7 @@ def ot_match(a, b):
 def drift_bands(bits, target, nb=94, frac=0.42, sigma=4.0):
     ys, xs = np.where(bits)
     pos = np.stack([xs, ys], 1).astype(float)
-    noisy = pos + rng.normal(0, sigma, pos.shape)      # <- breaks the grid
+    noisy = pos + rng.normal(0, sigma, pos.shape)
     dv = frac * (target - noisy)
     cent, lab = kmeans2(dv, nb, minit="++", seed=11, iter=40)
     band_d = np.zeros((nb, 2))
@@ -185,16 +212,11 @@ def drift_bands(bits, target, nb=94, frac=0.42, sigma=4.0):
     return xs, ys, lab, band_d
 
 def label_field(xs, ys, lab, mask):
-    """Propagate band labels to every subject cell so the metric is
-       independent of dot density (dark and light differ by ~40%)."""
     seed = -np.ones((GH, GW), int); seed[ys, xs] = lab
     ind = ndi.distance_transform_edt(seed < 0, return_distances=False, return_indices=True)
     return np.where(mask, seed[tuple(ind)], -1)
 
 def gridness(F):
-    """A square grid makes band-boundary edges pile onto a few x (or y) lines.
-       Excess share of edges in the top 5% of lines.
-       Validated: square-grid control ~0.57, unnoised ~0.12, sigma=4 ~0.08."""
     out = []
     for A in (F, F.T):
         v = (A[:, :-1] >= 0) & (A[:, 1:] >= 0) & (A[:, :-1] != A[:, 1:])
@@ -205,7 +227,6 @@ def gridness(F):
     return max(out)
 
 def evenness(xs, ys, groups, ng, cells=8):
-    """Mean TV-distance of each intro group vs the global dot distribution."""
     cy = (ys * cells // GH).clip(0, cells - 1); cx = (xs * cells // GW).clip(0, cells - 1)
     cid = cy * cells + cx
     glob = np.bincount(cid, minlength=cells * cells).astype(float); glob /= glob.sum()
@@ -219,7 +240,6 @@ def evenness(xs, ys, groups, ng, cells=8):
 
 # ══════════════════════════════════════════════════════════ 4. path runs
 def runs_path(xs, ys):
-    """Horizontal run-merge, then stack identical runs vertically into rects."""
     if len(xs) == 0: return ""
     o = np.lexsort((xs, ys)); xs, ys = xs[o], ys[o]
     hr = []; i = 0; n = len(xs)
@@ -268,13 +288,13 @@ def build_svg(theme, bits, bands, travellers, metrics):
     # ── portrait frame
     A(f'<rect x="{FR_X}" y="{FR_Y}" width="{FR_W}" height="{FR_H}" rx="10" '
       f'fill="{P["panel"]}" stroke="{P["line"]}"/>')
-    A(f'<text x="{FR_X+14}" y="{FR_Y-9}" font-size="11" fill="{P["chrome"]}" '
+    A(f'<text x="{FR_X+14}" y="{FR_Y+24}" font-size="11" fill="{P["chrome"]}" '
       f'letter-spacing="1.6">VISUAL.MAP</text>')
-    A(f'<clipPath id="pc"><rect x="{PT_X}" y="{PT_Y}" width="{GW*SCALE:.1f}" height="{GH*SCALE:.1f}"/></clipPath>')
-    A(f'<g clip-path="url(#pc)"><g transform="translate({PT_X},{PT_Y}) scale({SCALE})" '
+    A(f'<clipPath id="pc_{theme}"><rect x="{PT_X}" y="{PT_Y}" width="{GW*SCALE:.1f}" height="{GH*SCALE:.1f}"/></clipPath>')
+    A(f'<g clip-path="url(#pc_{theme})"><g transform="translate({PT_X},{PT_Y}) scale({SCALE})" '
       f'shape-rendering="crispEdges" fill="{P["portrait"]}">')
 
-    # intro layer — 60 interleaved random groups (separate layer, do not merge)
+    # intro layer — 60 interleaved random groups
     NG = 60
     grp = metrics["groups"]
     A(f'<g id="intro">')
@@ -304,7 +324,6 @@ def build_svg(theme, bits, bands, travellers, metrics):
 
     # travellers — OT-matched logo morph
     L1, L2, L3 = travellers
-    # one opacity animation for the whole layer, not 889 copies
     A(f'<g id="trav" fill="{P["accent"]}" opacity="0">'
       f'<animate attributeName="opacity" values="0;0;1;1;1;1;1;1;0" keyTimes="{KTS}" '
       f'dur="{DUR}s" begin="{INTRO}s" repeatCount="indefinite"/>')
@@ -355,33 +374,33 @@ def build_svg(theme, bits, bands, travellers, metrics):
 
 # ══════════════════════════════════════════════════════════ main
 if __name__ == "__main__":
+    print(f"Using source photo: {SRC}")
     dark, light, core = portrait_bits()
-    np.save("/home/claude/dark_bits.npy", dark)
-    np.save("/home/claude/light_bits.npy", light)
+    
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+    np.save(os.path.join(output_dir, "dark_bits.npy"), dark)
+    np.save(os.path.join(output_dir, "light_bits.npy"), light)
 
     clouds = [logo_points(n) for n in LOGOS]
     a, b, c1 = ot_match(clouds[0], clouds[1])
     b2, c, c2 = ot_match(b, clouds[2])
-    # re-align a to b2 ordering
+    
     idx = {tuple(np.round(p, 6)): i for i, p in enumerate(b)}
     order = [idx[tuple(np.round(p, 6))] for p in b2]
     L1, L2, L3 = a[order], b2, c
-    np.save("/home/claude/travellers.npy", np.stack([L1, L2, L3]))
+    np.save(os.path.join(output_dir, "travellers.npy"), np.stack([L1, L2, L3]))
     print(f"travellers      : {len(L1)}  mean OT hop {c1:.1f} / {c2:.1f} px")
 
     out = {}
     target = L1.mean(0)
     for theme, bits in (("dark", dark), ("light", light)):
         xs, ys, lab, band_d = drift_bands(bits, target)
-        groups = rng.integers(0, 60, len(xs))          # interleaved, NOT spatial
+        groups = rng.integers(0, 60, len(xs))
 
         gn = gridness(label_field(xs, ys, lab, core))
-        # control: bands built WITHOUT the per-dot noise
-        _, lab0 = kmeans2(0.42 * (target - np.stack([xs, ys], 1)), 94,
-                          minit="++", seed=11, iter=40)
+        lab0 = kmeans2(0.42 * (target - np.stack([xs, ys], 1)), 94, minit="++", seed=11, iter=40)[1]
         gn0 = gridness(label_field(xs, ys, lab0, core))
         ev = evenness(xs, ys, groups, 60)
-        # control: spatial grouping (the failure mode the spec warns about)
         spat = (np.argsort(np.argsort(ys * GW + xs)) * 60 // len(xs)).clip(0, 59)
         ev_bad = evenness(xs, ys, spat, 60)
 
@@ -390,7 +409,11 @@ if __name__ == "__main__":
               f"evenness={ev:.3f} (spatial {ev_bad:.3f})")
         svg = build_svg(theme, bits, (xs, ys, lab, band_d), (L1, L2, L3),
                         dict(groups=groups))
-        open(f"/mnt/user-data/outputs/{theme}.svg", "w").write(svg)
+        
+        target_svg = os.path.join(output_dir, f"{theme}.svg")
+        with open(target_svg, "w", encoding="utf-8") as f:
+            f.write(svg)
         out[theme] = len(svg)
+
     for k, v in out.items():
         print(f"{k}.svg  {v/1024:.0f} KB")
